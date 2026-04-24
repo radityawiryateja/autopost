@@ -8,7 +8,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from supabase import create_client
 
-# Pengambilan Environment Variables (Bukan lagi dari Colab Secrets)
+# 1. PENGAMBILAN ENVIRONMENT VARIABLES (CHOREO)
+# Pastikan Key ini sudah Anda masukkan di menu Configs & Secrets di Choreo
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 CHANNEL_ID = os.getenv('CHANNEL_ID')
 GROUP_ID_DISKUSI = int(os.getenv('GROUP_ID_DISKUSI', 0))
@@ -17,13 +18,13 @@ LOG_GROUP_ID = int(os.getenv('LOG_GROUP_ID', 0))
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 
-# Logging
+# Logging Konfigurasi
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 bot_active = True
 
-# Inisialisasi Supabase
+# 2. INISIALISASI SUPABASE
 try:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 except Exception as e:
@@ -58,41 +59,149 @@ async def on_startup(application: Application):
     except Exception as e:
         logger.error(f"⚠️ Gagal startup: {e}")
 
-# ... (Fungsi save_required_channels, check_subscription, add_hashtag, dll tetap sama seperti kode asli) ...
-# Salin semua fungsi handler (start, handle_pesan, handle_admin_reply, handle_discussion, broadcast, dll) dari kode Colab Anda ke sini.
-# Pastikan tidak ada perubahan logika, cukup pindahkan fungsinya di bawah ini.
+def save_required_channels(channels):
+    try:
+        supabase.table('required_channels').delete().neq("channel_username", "").execute()
+        for channel in channels:
+            supabase.table('required_channels').insert({"channel_username": channel}).execute()
+    except Exception as e:
+        logger.error(f"Gagal menyimpan required channels: {e}")
 
-# --- BAGIAN MAIN UNTUK DEPLOYMENT ---
+async def check_subscription(user_id, context: CallbackContext):
+    if not required_channels: return True
+    for channel in required_channels:
+        try:
+            member = await context.bot.get_chat_member(chat_id=channel, user_id=user_id)
+            if member.status not in ['member', 'administrator', 'creator']: return False
+        except Exception: return False
+    return True
+
+async def save_user(user_id, username):
+    try:
+        supabase.table("users").upsert({"user_id": user_id, "username": username}, on_conflict=["user_id"]).execute()
+    except Exception: pass
+
+# --- HANDLERS ---
+async def start(update: Update, context: CallbackContext):
+    if update.effective_chat.type != "private": return
+    user_id = update.effective_user.id
+    await save_user(user_id, update.effective_user.username)
+
+    if await check_subscription(user_id, context):
+        await update.message.reply_text(
+            "Halo, selamat datang di *Bazarfess*! ☕️\n\n"
+            "Ketuk /menu untuk menampilkan navigasi", parse_mode="Markdown"
+        )
+    else:
+        keyboard = [[InlineKeyboardButton("Join Channels", url=f"https://t.me/{c[1:]}")] for c in required_channels]
+        await update.message.reply_text("Sebelum lanjut, silakan join channel berikut dulu ya!", reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
+
+async def handle_pesan(update: Update, context: CallbackContext):
+    global bot_active
+    if update.effective_chat.type != "private": return
+    if not bot_active: return await update.message.reply_text("Bot sedang dipause oleh admin.")
+
+    user_id = update.effective_user.id
+
+    if update.message.reply_to_message:
+        replied_text = update.message.reply_to_message.text or update.message.reply_to_message.caption or ""
+        match = re.search(r"#ID:(\d+)", replied_text)
+        if match:
+            try:
+                comment_msg_id = int(match.group(1))
+                if update.message.text:
+                    await context.bot.send_message(chat_id=GROUP_ID_DISKUSI, text=f"🗣️ *Balasan Sender:*\n\n{update.message.text}", reply_to_message_id=comment_msg_id, parse_mode="Markdown")
+                else:
+                    caption = f"🗣️ *Balasan Sender:*\n\n{update.message.caption or ''}"
+                    await context.bot.copy_message(chat_id=GROUP_ID_DISKUSI, from_chat_id=user_id, message_id=update.message.message_id, reply_to_message_id=comment_msg_id, caption=caption, parse_mode="Markdown")
+                await update.message.reply_text("✅ Balasan anonim berhasil dikirim!")
+                return
+            except Exception:
+                await update.message.reply_text("❌ Gagal mengirim balasan anonim.")
+                return
+
+    if not await check_subscription(user_id, context):
+        keyboard = [[InlineKeyboardButton("Join Channel", url=f"https://t.me/{c[1:]}")] for c in required_channels]
+        return await update.message.reply_text("Silakan join channel dulu ya!", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    text_content = (update.message.text or update.message.caption or "").strip().lower()
+    is_direct_forward = any(ht.lower() in text_content for ht in CACHE_HASHTAGS)
+
+    target_chat_id = CHANNEL_ID if is_direct_forward else ADMIN_GROUP_ID
+    try:
+        if update.message.text:
+            text_msg = update.message.text if is_direct_forward else f"📩 Pesan dari: {update.effective_user.first_name}\n🆔 ID: {user_id}\n\n💬 Pesan:\n{update.message.text}"
+            message_sent = await context.bot.send_message(chat_id=target_chat_id, text=text_msg)
+        else:
+            cap = update.message.caption if is_direct_forward else f"📩 Pesan dari: {update.effective_user.first_name}\n🆔 ID: {user_id}\n\n💬 Pesan:\n{update.message.caption or ''}"
+            message_sent = await context.bot.copy_message(chat_id=target_chat_id, from_chat_id=user_id, message_id=update.message.message_id, caption=cap)
+        
+        if is_direct_forward:
+            await update.message.reply_text("Pesan kamu telah terkirim ke channel!")
+            supabase.table("menfess_map").insert({"post_id": message_sent.message_id, "sender_user_id": user_id}).execute()
+        else:
+            await update.message.reply_text("Pesan terkirim ke admin.")
+    except Exception as e:
+        logger.error(f"Error: {e}")
+
+async def handle_admin_reply(update: Update, context: CallbackContext):
+    if update.effective_chat.id != ADMIN_GROUP_ID or not update.message.reply_to_message: return
+    match = re.search(r"ID(?:\s*Pengguna)?:?\s*(\d+)", update.message.reply_to_message.text or update.message.reply_to_message.caption or "")
+    if not match: return
+    user_id = int(match.group(1))
+    try:
+        await context.bot.copy_message(chat_id=user_id, from_chat_id=ADMIN_GROUP_ID, message_id=update.message.message_id)
+        await update.message.reply_text("✅ Terkirim.")
+    except Exception: await update.message.reply_text("❌ Gagal.")
+
+async def handle_discussion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg: return
+    if msg.is_automatic_forward and msg.forward_origin and msg.forward_origin.type == "channel":
+        if msg.forward_origin.chat.username and ("@" + msg.forward_origin.chat.username.lower() == CHANNEL_ID.lower()):
+            try: supabase.table("menfess_map").update({"discussion_message_id": msg.message_id}).eq("post_id", msg.forward_origin.message_id).execute()
+            except: pass
+        return
+    if msg.reply_to_message:
+        try:
+            res = supabase.table("menfess_map").select("sender_user_id").eq("discussion_message_id", msg.reply_to_message.message_id).execute()
+            if res.data:
+                await context.bot.send_message(chat_id=res.data[0]["sender_user_id"], text=f"📬 Komentar baru di menfess kamu!\n\n`#ID:{msg.message_id}`", parse_mode="Markdown")
+        except: pass
+
+async def menu(update: Update, context: CallbackContext):
+    await update.message.reply_text("📜 *Menu Bazarfess*", parse_mode="Markdown")
+
+async def open_bot(update: Update, context: CallbackContext):
+    global bot_active
+    if update.effective_chat.id == ADMIN_GROUP_ID:
+        bot_active = True
+        await update.message.reply_text("✅ Bot ON.")
+
+async def close_bot(update: Update, context: CallbackContext):
+    global bot_active
+    if update.effective_chat.id == ADMIN_GROUP_ID:
+        bot_active = False
+        await update.message.reply_text("⏸️ Bot OFF.")
+
+# --- MAIN ---
 def main():
-    # Pastikan Token ada
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN tidak ditemukan di Environment Variables!")
+        logger.error("BOT_TOKEN Kosong!")
         return
 
     application = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
-    # Handlers
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('menu', menu))
     application.add_handler(CommandHandler('open', open_bot))
     application.add_handler(CommandHandler('close', close_bot))
-    application.add_handler(CommandHandler('grupid', get_group_id))
-    application.add_handler(CommandHandler('setrequired', set_required_channels))
-    application.add_handler(CommandHandler("addhashtag", add_hashtag))
-    application.add_handler(CommandHandler("removehashtag", remove_hashtag))
-    application.add_handler(CommandHandler("enablehashtag", enable_hashtag))
-    application.add_handler(CommandHandler("disablehashtag", disable_hashtag))
-    application.add_handler(CommandHandler('broadcastfw', broadcast_forward))
-    application.add_handler(CommandHandler('broadcast', broadcast))
-    application.add_handler(CommandHandler("addcommand", add_command))
-    application.add_handler(CommandHandler("deletecommand", delete_command))
-    application.add_handler(CommandHandler("settings", settings))
-
+    
     application.add_handler(MessageHandler(filters.ALL & filters.Chat(ADMIN_GROUP_ID), handle_admin_reply))
     application.add_handler(MessageHandler(filters.Chat(GROUP_ID_DISKUSI), handle_discussion))
     application.add_handler(MessageHandler(filters.ALL & filters.ChatType.PRIVATE, handle_pesan))
 
-    logger.info("🚀 Bot running via Polling...")
+    logger.info("🚀 Bot Running via Polling di Choreo...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
